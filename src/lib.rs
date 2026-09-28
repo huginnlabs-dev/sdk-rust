@@ -1,0 +1,469 @@
+//! HuginnLabs Dataflow SDK for Rust — runtime tracing with E2E-encrypted
+//! payloads.
+//!
+//! RAII spans (mirroring the C++ SDK), a thread-local trace context and a
+//! background sender shipping REST ingest batches (`POST /api/v1/ingest`).
+//! Payload field names travel as plaintext metadata (lineage + PII
+//! categories); values are AES-256-GCM encrypted with a PBKDF2-derived key
+//! that never leaves the process.
+//!
+//! ```no_run
+//! dataflow_rs::configure();
+//! dataflow_rs::trace("dispatch.Route", |span| {
+//!     span.data_str("city", "Riga");
+//!     dataflow_rs::trace("geo.Resolve", |s| { s.data_str("city", "Riga"); });
+//! }); // span ends and is queued here
+//! ```
+//!
+//! Env: `DATAFLOW_ENDPOINT` (http://host:port — plaintext HTTP, front it
+//! with a TLS-terminating proxy for WAN), `DATAFLOW_API_KEY`,
+//! `DATAFLOW_SERVICE_NAME`, `DATAFLOW_ENCRYPTION_KEY`,
+//! `DATAFLOW_SAMPLE_RATIO`, `DATAFLOW_BUFFER_SIZE`, `DATAFLOW_DISABLED`.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod crypto;
+pub mod json;
+mod pii;
+mod pipeline;
+
+/// SDK version stamped into agent metadata.
+pub const SDK_VERSION: &str = "0.1.0";
+
+/// Payload field value: a small JSON-ready enum (no serde dependency).
+#[derive(Clone, Debug)]
+pub enum Value {
+    Str(String),
+    Num(f64),
+    Bool(bool),
+    Raw(String), // pre-serialized JSON
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Self { Value::Str(v.to_string()) }
+}
+impl From<String> for Value {
+    fn from(v: String) -> Self { Value::Str(v) }
+}
+impl From<i64> for Value {
+    fn from(v: i64) -> Self { Value::Num(v as f64) }
+}
+impl From<f64> for Value {
+    fn from(v: f64) -> Self { Value::Num(v) }
+}
+impl From<bool> for Value {
+    fn from(v: bool) -> Self { Value::Bool(v) }
+}
+
+/// Immutable SDK settings.
+#[derive(Clone)]
+pub struct Settings {
+    pub endpoint: String,
+    pub api_key: String,
+    pub service_name: String,
+    pub encryption_key: String,
+    pub sample_ratio: f64,
+    pub buffer_size: usize,
+    pub disabled: bool,
+}
+
+fn env_or(key: &str, fallback: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| fallback.to_string())
+}
+
+fn env_num(key: &str, fallback: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
+}
+
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
+static SENDER_STARTED: AtomicBool = AtomicBool::new(false);
+static HOSTNAME: OnceLock<String> = OnceLock::new();
+
+/// Configures the SDK from `DATAFLOW_*` environment variables and starts
+/// the background sender. Idempotent: repeated calls update settings but
+/// never spawn a second sender.
+pub fn configure() {
+    let disabled = env_or("DATAFLOW_DISABLED", "false") == "true";
+    let s = Settings {
+        endpoint: env_or("DATAFLOW_ENDPOINT", ""),
+        api_key: env_or("DATAFLOW_API_KEY", ""),
+        service_name: env_or("DATAFLOW_SERVICE_NAME", ""),
+        encryption_key: env_or("DATAFLOW_ENCRYPTION_KEY", ""),
+        sample_ratio: env_num("DATAFLOW_SAMPLE_RATIO", 1.0),
+        buffer_size: env_num("DATAFLOW_BUFFER_SIZE", 10_000.0) as usize,
+        disabled,
+    };
+    let _ = SETTINGS.set(s.clone());
+    // compare_exchange yields Ok(previous): a successful first start reads
+    // Ok(false), so test is_ok() — NOT Ok(true).
+    let not_yet_started = SENDER_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    if SETTINGS.get().map(|s| !s.disabled && !s.endpoint.is_empty() && !s.api_key.is_empty()) == Some(true)
+        && not_yet_started
+    {
+        pipeline::start();
+    }
+}
+
+/// True when spans are collected and shipped.
+pub fn enabled() -> bool {
+    match SETTINGS.get() {
+        Some(s) => !s.disabled && !s.endpoint.is_empty() && !s.api_key.is_empty(),
+        None => false,
+    }
+}
+
+fn settings() -> &'static Settings {
+    static PASSIVE: OnceLock<Settings> = OnceLock::new();
+    SETTINGS.get().unwrap_or_else(|| {
+        PASSIVE.get_or_init(|| Settings {
+            endpoint: String::new(),
+            api_key: String::new(),
+            service_name: String::new(),
+            encryption_key: String::new(),
+            sample_ratio: 1.0,
+            buffer_size: 10_000,
+            disabled: true,
+        })
+    })
+}
+
+fn service_name() -> String {
+    let n = settings().service_name.clone();
+    if !n.is_empty() {
+        return n;
+    }
+    HOSTNAME
+        .get_or_init(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        })
+        .clone()
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn new_id() -> String {
+    // UUIDv4-shaped id from the OS RNG.
+    let mut b = [0u8; 16];
+    fill_random(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    hex.to_string()
+}
+
+pub(crate) fn fill_random(buf: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(buf);
+        return;
+    }
+    // Fallback: hash of time + address entropy (never used on Linux).
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut state = seed as u64 ^ (&buf as *const _ as u64);
+    for slot in buf.iter_mut() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *slot = (state >> 33) as u8;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Span
+
+/// One measured unit of work. Cloneable handle over shared state; ends
+/// automatically when the owning [`Trace`] scope drops.
+#[derive(Clone)]
+pub struct Span {
+    inner: Arc<SpanInner>,
+}
+
+struct SpanInner {
+    state: Mutex<SpanState>,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    caller: String,
+    name: String,
+    kind: &'static str,
+    start_ms: i64,
+    start_nanos: std::time::Instant,
+    sampled: bool,
+}
+
+#[derive(Default)]
+struct SpanState {
+    attrs: BTreeMap<String, String>,
+    payload: BTreeMap<String, Value>,
+    error: String,
+    status: i32,
+    callee: String,
+    ended: bool,
+}
+
+impl Span {
+    fn new(name: &str, kind: &'static str, parent: Option<&Span>) -> Span {
+        Self::with_trace(name, kind, parent, None)
+    }
+
+    fn with_trace(
+        name: &str,
+        kind: &'static str,
+        parent: Option<&Span>,
+        trace_override: Option<String>,
+    ) -> Span {
+        let sampled = settings().sample_ratio >= 1.0
+            || rand_float() < settings().sample_ratio;
+        let callee = if kind == "FUNCTION_CALL" {
+            name.split('.').next().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        Span {
+            inner: Arc::new(SpanInner {
+                state: Mutex::new(SpanState {
+                    callee,
+                    ..Default::default()
+                }),
+                trace_id: trace_override
+                    .or_else(|| parent.map(|p| p.inner.trace_id.clone()))
+                    .unwrap_or_else(new_id),
+                span_id: new_id(),
+                parent_span_id: parent.map(|p| p.inner.span_id.clone()).unwrap_or_default(),
+                // Caller attribution mirrors the other SDKs: the enclosing
+                // span's package; roots stay empty (no self-edges).
+                caller: parent.map(|p| p.inner.state.lock().unwrap().callee.clone()).unwrap_or_default(),
+                name: name.to_string(),
+                kind,
+                start_ms: now_ms(),
+                start_nanos: std::time::Instant::now(),
+                sampled,
+            }),
+        }
+    }
+
+    /// Plaintext attribute (metadata entry).
+    pub fn attr(&self, key: &str, value: &str) -> &Self {
+        self.inner.state.lock().unwrap().attrs.insert(key.into(), value.into());
+        self
+    }
+
+    /// Payload field — values are encrypted at end when a key is set.
+    pub fn data(&self, key: &str, value: impl Into<Value>) -> &Self {
+        self.inner.state.lock().unwrap().payload.insert(key.into(), value.into());
+        self
+    }
+
+    /// Payload field holding a pre-serialized JSON document.
+    pub fn data_json(&self, key: &str, raw_json: &str) -> &Self {
+        self.data(key, Value::Raw(raw_json.into()))
+    }
+
+    /// Marks this span's package (or host) for the data-flow graph.
+    pub fn callee(&self, pkg: &str) -> &Self {
+        self.inner.state.lock().unwrap().callee = pkg.into();
+        self
+    }
+
+    pub fn record_error(&self, message: &str) -> &Self {
+        let mut st = self.inner.state.lock().unwrap();
+        if st.error.is_empty() {
+            st.error = message.into();
+        } else {
+            st.error = format!("{}; {}", st.error, message);
+        }
+        st.status = 500;
+        self
+    }
+
+    /// HTTP status or gRPC code.
+    pub fn status(&self, code: i32) -> &Self {
+        self.inner.state.lock().unwrap().status = code;
+        self
+    }
+
+    pub fn trace_id(&self) -> String { self.inner.trace_id.clone() }
+
+    /// Ends the span and queues it for delivery (idempotent).
+    pub fn end(&self) {
+        if !self.inner.sampled {
+            return;
+        }
+        let (meta, payload, error, status, callee) = {
+            let mut st = self.inner.state.lock().unwrap();
+            if st.ended {
+                return;
+            }
+            st.ended = true;
+            (
+                st.attrs.clone(),
+                st.payload.clone(),
+                st.error.clone(),
+                st.status,
+                st.callee.clone(),
+            )
+        };
+        let duration_ms = self.inner.start_nanos.elapsed().as_millis() as i64;
+
+        let mut fields: Vec<String> = payload.keys().cloned().collect();
+        fields.sort();
+        let mut meta = meta;
+        if !fields.is_empty() {
+            meta.insert("data.fields".into(), fields.join(","));
+            let pii = pii::classify(&fields);
+            if !pii.is_empty() {
+                meta.insert("data.pii".into(), pii);
+            }
+        }
+
+        let payload_json = if payload.is_empty() {
+            "null".to_string()
+        } else {
+            crypto::seal(&payload)
+        };
+        pipeline::enqueue(json::event_json(
+            &new_id(),
+            pipeline::next_seq(),
+            &self.inner.trace_id,
+            &self.inner.span_id,
+            &self.inner.parent_span_id,
+            self.inner.kind,
+            &service_name(),
+            &self.inner.name,
+            &self.inner.caller,
+            &callee,
+            error.as_str(),
+            status,
+            self.inner.start_ms,
+            duration_ms,
+            &meta,
+            &payload_json,
+        ));
+    }
+}
+
+fn rand_float() -> f64 {
+    let mut b = [0u8; 8];
+    fill_random(&mut b);
+    u64::from_le_bytes(b) as f64 / u64::MAX as f64
+}
+
+// ---------------------------------------------------------------------------
+// Trace scope + thread-local context
+
+thread_local! {
+    static CURRENT: RefCell<Option<Span>> = const { RefCell::new(None) };
+}
+
+/// The span active on this thread, if any.
+pub fn current() -> Option<Span> { CURRENT.with(|c| c.borrow().clone()) }
+
+/// RAII scope: opens a span named `name`, makes it the thread's current
+/// one and ends it on drop — the Rust analogue of the C++ Trace and the
+/// Java try-with-resources.
+pub struct Trace {
+    span: Span,
+    previous: Option<Span>,
+    skip_drop: bool,
+}
+
+impl Trace {
+    /// Opens a FUNCTION_CALL child of the current span (or a new trace).
+    pub fn new(name: &str) -> Trace { Trace::with_kind(name, "FUNCTION_CALL") }
+
+    /// Opens a span of an explicit event type (HTTP_SERVER, HTTP_CLIENT…).
+    pub fn with_kind(name: &str, kind: &'static str) -> Trace {
+        let previous = current();
+        let span = Span::new(name, kind, previous.as_ref());
+        CURRENT.with(|c| *c.borrow_mut() = Some(span.clone()));
+        Trace { span, previous, skip_drop: false }
+    }
+
+    /// The active span.
+    pub fn span(&self) -> &Span { &self.span }
+
+    /// Ends the span without waiting for the scope to drop.
+    pub fn end_now(&mut self) {
+        self.span.end();
+        self.skip_drop = true;
+    }
+}
+
+impl Drop for Trace {
+    fn drop(&mut self) {
+        if !self.skip_drop {
+            self.span.end();
+        }
+        CURRENT.with(|c| *c.borrow_mut() = self.previous.clone());
+    }
+}
+
+/// Runs `body` inside a named span (convenience over [`Trace`]).
+pub fn trace<T>(name: &str, body: impl FnOnce(&Span) -> T) -> T {
+    let mut t = Trace::new(name);
+    let out = body(t.span());
+    t.end_now();
+    out
+}
+
+/// Opens an entry-point (HTTP_SERVER) root span and stamps agent metadata.
+pub fn start_server_span(route: &str) -> Span {
+    let span = Span::with_trace(route, "HTTP_SERVER", None, None);
+    for (k, v) in agent_attrs() {
+        span.attr(&k, &v);
+    }
+    span
+}
+
+/// Same as [`start_server_span`], adopting an incoming
+/// `X-Dataflow-Trace-Id` header so the caller service joins the trace.
+pub fn start_server_span_inherited(route: &str, incoming_trace_id: &str) -> Span {
+    let span = Span::with_trace(
+        route,
+        "HTTP_SERVER",
+        None,
+        if incoming_trace_id.is_empty() { None } else { Some(incoming_trace_id.to_string()) },
+    );
+    for (k, v) in agent_attrs() {
+        span.attr(&k, &v);
+    }
+    span
+}
+
+/// Host/process descriptor stamped onto entry-point spans.
+pub fn agent_attrs() -> Vec<(String, String)> {
+    static AGENT: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            let mut v: Vec<(String, String)> = vec![
+                ("agent.os".into(), format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)),
+                ("agent.runtime".into(), "rust".into()),
+                ("agent.sdk".into(), format!("rust-sdk/{}", SDK_VERSION)),
+                ("agent.cpu".into(), std::thread::available_parallelism().map(|n| n.get().to_string()).unwrap_or_else(|_| "1".into())),
+                ("agent.pid".into(), std::process::id().to_string()),
+                ("agent.started".into(), now_ms().to_string()),
+            ];
+            if let Ok(env) = std::env::var("DATAFLOW_ENV") {
+                if !env.is_empty() { v.push(("agent.env".into(), env)); }
+            }
+            if let Ok(ver) = std::env::var("DATAFLOW_APP_VERSION") {
+                if !ver.is_empty() { v.push(("agent.app_version".into(), ver)); }
+            }
+            v
+        })
+        .clone()
+}

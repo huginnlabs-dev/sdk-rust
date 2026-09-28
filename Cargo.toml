@@ -1,0 +1,16 @@
+[package]
+name = "dataflow-rs"
+version = "0.1.0"
+edition = "2021"
+description = "HuginnLabs Dataflow SDK for Rust — runtime tracing with E2E-encrypted payloads"
+license = "MIT"
+
+[dependencies]
+# Pure-Rust RustCrypto stack: audited, no C toolchain required.
+aes-gcm = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+
+[profile.release]
+opt-level = 2
