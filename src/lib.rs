@@ -17,7 +17,9 @@
 //!
 //! Transport guards ([`http_span`] / [`db_span`]) wrap outgoing HTTP calls
 //! and database queries as HTTP_CLIENT / DB_QUERY spans — RAII, transport
-//! agnostic, no client-library dependencies.
+//! agnostic, no client-library dependencies. The `dataflow-scan` binary
+//! (the [`scan`] module) statically extracts declared HTTP routes from
+//! Rust sources and reports them to the server catalog.
 //!
 //! Env: `DATAFLOW_ENDPOINT` (http://host:port — plaintext HTTP, front it
 //! with a TLS-terminating proxy for WAN), `DATAFLOW_API_KEY`,
@@ -36,12 +38,13 @@ pub mod crypto;
 pub mod json;
 mod pii;
 mod pipeline;
+pub mod scan;
 pub mod transport;
 
 pub use transport::{db_span, http_span, DbSpan, HttpSpan};
 
 /// SDK version stamped into agent metadata and the service manifest.
-pub const SDK_VERSION: &str = "0.3.0";
+pub const SDK_VERSION: &str = "0.4.0";
 
 /// Payload field value: a small JSON-ready enum (no serde dependency).
 #[derive(Clone, Debug)]

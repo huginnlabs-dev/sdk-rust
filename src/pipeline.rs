@@ -134,9 +134,9 @@ fn flush(endpoint: &str, api_key: &str) -> Result<(), String> {
     }
 }
 
-struct Response {
-    status: String,
-    body: String,
+pub(crate) struct Response {
+    pub(crate) status: String,
+    pub(crate) body: String,
 }
 
 /// Ingest batch timeout (the SDK's long-standing HTTP timeout).
@@ -172,7 +172,9 @@ pub fn send_manifest() {
 
 /// Minimal HTTP/1.1 POST over a plain TCP stream — no dependencies. For
 /// WAN deployments put a TLS-terminating proxy in front of the endpoint.
-fn http_post(
+/// Crate-internal: shared by the ingest sender, the manifest reporter and
+/// the `dataflow-scan` catalog post.
+pub(crate) fn http_post(
     endpoint: &str,
     path: &str,
     api_key: &str,

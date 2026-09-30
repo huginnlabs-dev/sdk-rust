@@ -90,6 +90,58 @@ skipped and schema qualifiers reduce to the bare table, so
 `db.statement` (single-spaced, clipped to 200 chars). **Bind values are
 never captured** — only the statement text.
 
+## Route scanning — the `dataflow-scan` binary
+
+SDK 0.4.0 ships a second binary target, `dataflow-scan`: a static route
+scanner that extracts declared HTTP endpoints from Rust sources and posts
+them to the server catalog (`POST /api/v1/catalog`, API-key auth). The
+server correlates declared routes with observed `HTTP_SERVER` traffic and
+flags dead endpoints; a re-scan replaces the service's route set. It is
+std-only — hand-rolled argument parsing, and delivery reuses the SDK's
+minimal plaintext POST (front the endpoint with a TLS-terminating proxy
+for WAN).
+
+```sh
+cargo install --path . # or run via cargo: cargo run --bin dataflow-scan -- --dir . --print
+
+dataflow-scan --dir . --service orders-api --url http://dataflow:8080 --api-key $KEY
+```
+
+What it scans (line-based, regex-free; paths keep `{id}` / `:id` syntax as
+written):
+
+- **actix-web** attribute macros — `#[get("/orders/{id}")]` and
+  `#[post/put/delete/patch]`; the handler is the first `fn` name following
+  the attribute.
+- **axum** `.route("/orders", get(orders::list))` chains — the method
+  token right after the path literal, the handler from inside its parens
+  (chained `.route` calls, one per line typical, are all captured).
+- **warp is not scanned** — filter chains have no declarative route syntax
+  a line scanner can anchor on.
+
+Commented-out routes (`// #[get(...)]`, `// .route(...)`) are skipped, as
+are `target/` and `.git/` directories and non-rooted paths.
+
+Flags (each falls back to the environment, mirroring the SDK settings):
+
+| Flag | Meaning | Fallback |
+| --- | --- | --- |
+| `--dir DIR` | source root to scan | `.` |
+| `--service NAME` | service name stamped on routes | `DATAFLOW_SERVICE_NAME`, then dir basename |
+| `--url BASE` | HTTP API base | `DATAFLOW_HTTP_URL`, then URL-form `DATAFLOW_ENDPOINT` (a bare host:port endpoint has no derivable HTTP base — skipped with a message) |
+| `--api-key KEY` | catalog API key | `DATAFLOW_API_KEY` |
+| `--print` | print the catalog JSON to stdout instead of posting | — |
+
+Exit codes: `0` success, `1` runtime failure (bad directory, no derivable
+base URL, missing API key, server error), `2` usage error. Wire body:
+
+```json
+{"service_name":"orders-api","routes":[{"method":"GET","path":"/api/orders/{id}","handler":"orders::list","source_file":"src/orders.rs"}]}
+```
+
+At most 1000 routes are reported per service (server contract); exact
+duplicates collapse.
+
 ## Configuration
 
 | Variable | Meaning |
