@@ -45,6 +45,13 @@ pub fn enqueue(event_json: String) {
     sh.wake.notify_one();
 }
 
+/// Test hook: snapshot of the buffered event JSON lines (letting guard
+/// tests assert emission without a live endpoint).
+#[cfg(test)]
+pub(crate) fn buffered_events() -> Vec<String> {
+    shared().buffer.lock().unwrap().events.iter().cloned().collect()
+}
+
 fn trim_acked(acked: i64) {
     let sh = shared();
     let mut buf = sh.buffer.lock().unwrap();

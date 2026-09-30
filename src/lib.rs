@@ -15,6 +15,10 @@
 //! }); // span ends and is queued here
 //! ```
 //!
+//! Transport guards ([`http_span`] / [`db_span`]) wrap outgoing HTTP calls
+//! and database queries as HTTP_CLIENT / DB_QUERY spans — RAII, transport
+//! agnostic, no client-library dependencies.
+//!
 //! Env: `DATAFLOW_ENDPOINT` (http://host:port — plaintext HTTP, front it
 //! with a TLS-terminating proxy for WAN), `DATAFLOW_API_KEY`,
 //! `DATAFLOW_SERVICE_NAME`, `DATAFLOW_ENCRYPTION_KEY`,
@@ -32,9 +36,12 @@ pub mod crypto;
 pub mod json;
 mod pii;
 mod pipeline;
+pub mod transport;
+
+pub use transport::{db_span, http_span, DbSpan, HttpSpan};
 
 /// SDK version stamped into agent metadata and the service manifest.
-pub const SDK_VERSION: &str = "0.2.0";
+pub const SDK_VERSION: &str = "0.3.0";
 
 /// Payload field value: a small JSON-ready enum (no serde dependency).
 #[derive(Clone, Debug)]
@@ -279,7 +286,10 @@ struct SpanState {
 }
 
 impl Span {
-    fn new(name: &str, kind: &'static str, parent: Option<&Span>) -> Span {
+    /// Crate-internal constructor: the transport guards open client-side
+    /// spans (HTTP_CLIENT, DB_QUERY) parented to the current span without
+    /// becoming the thread's current one.
+    pub(crate) fn new(name: &str, kind: &'static str, parent: Option<&Span>) -> Span {
         Self::with_trace(name, kind, parent, None)
     }
 
