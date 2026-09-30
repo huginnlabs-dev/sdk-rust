@@ -286,18 +286,21 @@ fn split_url(url: &str) -> (String, String) {
     (authority.to_string(), path)
 }
 
+/// The test module is `pub(crate)` so the crash-capture tests can share
+/// the emission lock and the environment setup (both guard process-global
+/// state the unit tests must not mutate concurrently).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
     /// Serializes the emission tests: the pipeline buffer is process-global
     /// and cargo runs unit tests on parallel threads.
-    static EMIT_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static EMIT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Points the SDK at a port nothing listens on (connect refused, events
     /// stay buffered) so the enabled path can be exercised without network.
-    fn ensure_configured() {
+    pub(crate) fn ensure_configured() {
         std::env::set_var("DATAFLOW_ENDPOINT", "http://127.0.0.1:1");
         std::env::set_var("DATAFLOW_API_KEY", "test-key");
         std::env::set_var("DATAFLOW_SERVICE_NAME", "sdk-rust-tests");

@@ -90,6 +90,34 @@ skipped and schema qualifiers reduce to the bare table, so
 `db.statement` (single-spaced, clipped to 200 chars). **Bind values are
 never captured** — only the statement text.
 
+## Crash capture — panics with stack traces
+
+`capture_panic` (SDK 0.5.0) wraps any closure — typically a request
+handler body — with `catch_unwind`: when the closure panics, the crash is
+recorded and the panic **resumes** — recording never swallows it, and the
+original payload travels unchanged to the framework's own catcher or your
+`catch_unwind`. The crashing span gets `status_code` 500, `error_message`
+(the formatted panic payload, clipped to 500 chars) and metadata
+`error.stack` (the rendered backtrace, clipped to its first 8192 bytes,
+top kept). When the thread has no current span, a synthetic `panic` span
+is recorded instead.
+
+```rust,ignore
+use dataflow_rs::capture_panic;
+
+fn orders_handler(req: Request) -> Response {
+    capture_panic(|| route_orders(req)) // panics keep unwinding after recording
+}
+```
+
+For threads you do not spawn yourself (framework workers, thread pools),
+install the process-wide hook once at startup: `capture_uncaught()`
+records a synthetic `uncaught panic` span per crash (message + stack) and
+then chains to the previously installed hook, so existing reporting keeps
+working. Repeated calls are no-ops; `ignore_uncaught()` restores the
+previous hook. With the SDK disabled both helpers are pure pass-through —
+chain and resume only, nothing recorded.
+
 ## Route scanning — the `dataflow-scan` binary
 
 SDK 0.4.0 ships a second binary target, `dataflow-scan`: a static route

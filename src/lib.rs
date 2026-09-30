@@ -17,9 +17,13 @@
 //!
 //! Transport guards ([`http_span`] / [`db_span`]) wrap outgoing HTTP calls
 //! and database queries as HTTP_CLIENT / DB_QUERY spans — RAII, transport
-//! agnostic, no client-library dependencies. The `dataflow-scan` binary
-//! (the [`scan`] module) statically extracts declared HTTP routes from
-//! Rust sources and reports them to the server catalog.
+//! agnostic, no client-library dependencies. Crash capture
+//! ([`capture_panic`] / [`capture_uncaught`]) records panics with
+//! `error.stack` backtraces on the current span or a synthetic span and
+//! always resumes (or chains) so crash handling stays with the framework.
+//! The `dataflow-scan` binary (the [`scan`] module) statically extracts
+//! declared HTTP routes from Rust sources and reports them to the server
+//! catalog.
 //!
 //! Env: `DATAFLOW_ENDPOINT` (http://host:port — plaintext HTTP, front it
 //! with a TLS-terminating proxy for WAN), `DATAFLOW_API_KEY`,
@@ -34,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod crash;
 pub mod crypto;
 pub mod json;
 mod pii;
@@ -41,10 +46,11 @@ mod pipeline;
 pub mod scan;
 pub mod transport;
 
+pub use crash::{capture_panic, capture_uncaught, ignore_uncaught};
 pub use transport::{db_span, http_span, DbSpan, HttpSpan};
 
 /// SDK version stamped into agent metadata and the service manifest.
-pub const SDK_VERSION: &str = "0.4.0";
+pub const SDK_VERSION: &str = "0.5.0";
 
 /// Payload field value: a small JSON-ready enum (no serde dependency).
 #[derive(Clone, Debug)]
