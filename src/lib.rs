@@ -10,15 +10,17 @@
 //! ```no_run
 //! dataflow_rs::configure();
 //! dataflow_rs::trace("dispatch.Route", |span| {
-//!     span.data_str("city", "Riga");
-//!     dataflow_rs::trace("geo.Resolve", |s| { s.data_str("city", "Riga"); });
+//!     span.data("city", "Riga");
+//!     dataflow_rs::trace("geo.Resolve", |s| { s.data("city", "Riga"); });
 //! }); // span ends and is queued here
 //! ```
 //!
 //! Env: `DATAFLOW_ENDPOINT` (http://host:port — plaintext HTTP, front it
 //! with a TLS-terminating proxy for WAN), `DATAFLOW_API_KEY`,
 //! `DATAFLOW_SERVICE_NAME`, `DATAFLOW_ENCRYPTION_KEY`,
-//! `DATAFLOW_SAMPLE_RATIO`, `DATAFLOW_BUFFER_SIZE`, `DATAFLOW_DISABLED`.
+//! `DATAFLOW_SAMPLE_RATIO`, `DATAFLOW_BUFFER_SIZE`, `DATAFLOW_DISABLED`,
+//! `DATAFLOW_HTTP_URL` (HTTP API base for manifest reporting when the
+//! endpoint is a bare gRPC host:port), `DATAFLOW_APP_VERSION`.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -31,8 +33,8 @@ pub mod json;
 mod pii;
 mod pipeline;
 
-/// SDK version stamped into agent metadata.
-pub const SDK_VERSION: &str = "0.1.0";
+/// SDK version stamped into agent metadata and the service manifest.
+pub const SDK_VERSION: &str = "0.2.0";
 
 /// Payload field value: a small JSON-ready enum (no serde dependency).
 #[derive(Clone, Debug)]
@@ -180,6 +182,67 @@ pub(crate) fn fill_random(buf: &mut [u8]) {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *slot = (state >> 33) as u8;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service manifest
+
+/// Builds the startup service-manifest body (`POST /api/v1/manifest`) with
+/// the existing JSON writer; field order is fixed by the wire contract.
+///
+/// `runtime_version` is empty — Rust binaries are statically linked and
+/// carry no discoverable runtime; a build script can opt in by setting
+/// `DATAFLOW_RUNTIME` at compile time. `framework` stays empty for v1
+/// (no reliable runtime detection in Rust) and `dependencies` stays empty:
+/// statically linked binaries have no runtime dependency inventory
+/// (build-time generation, e.g. from Cargo.lock via a build script, may
+/// come later).
+pub fn build_manifest(service_name: &str, sdk_version: &str) -> String {
+    build_manifest_with(
+        service_name,
+        sdk_version,
+        &std::env::var("DATAFLOW_APP_VERSION").unwrap_or_default(),
+    )
+}
+
+/// [`build_manifest`] with the app version injected (testability).
+pub(crate) fn build_manifest_with(service_name: &str, sdk_version: &str, app_version: &str) -> String {
+    let mut sb = String::with_capacity(256);
+    sb.push('{');
+    sb.push_str("\"service_name\":");
+    json::escape(&mut sb, service_name);
+    sb.push_str(",\"language\":");
+    json::escape(&mut sb, "rust");
+    sb.push_str(",\"sdk_version\":");
+    json::escape(&mut sb, sdk_version);
+    sb.push_str(",\"runtime_version\":");
+    json::escape(&mut sb, option_env!("DATAFLOW_RUNTIME").unwrap_or(""));
+    sb.push_str(",\"framework\":");
+    json::escape(&mut sb, "");
+    sb.push_str(",\"os_arch\":");
+    json::escape(&mut sb, &format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH));
+    sb.push_str(",\"app_version\":");
+    json::escape(&mut sb, app_version);
+    // No runtime dependency inventory for statically linked binaries (v1).
+    sb.push_str(",\"dependencies\":[]");
+    sb.push('}');
+    sb
+}
+
+/// Resolves the HTTP API base for manifest reporting: the
+/// `DATAFLOW_HTTP_URL` value (`http_url_env`, "" when unset) wins — needed
+/// when the endpoint is a bare gRPC host:port; URL-form endpoints map
+/// directly; anything else has no derivable HTTP base and reporting is
+/// skipped. Trailing slashes are trimmed.
+pub(crate) fn http_base(endpoint: &str, http_url_env: &str) -> Option<String> {
+    let override_url = http_url_env.trim();
+    if !override_url.is_empty() {
+        return Some(override_url.trim_end_matches('/').to_string());
+    }
+    if endpoint.starts_with("https://") || endpoint.starts_with("http://") {
+        return Some(endpoint.trim_end_matches('/').to_string());
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -466,4 +529,102 @@ pub fn agent_attrs() -> Vec<(String, String)> {
             v
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_fields_match_wire_contract() {
+        let body = build_manifest_with("payments", SDK_VERSION, "1.4.2");
+        assert!(body.contains("\"service_name\":\"payments\""), "{}", body);
+        assert!(body.contains("\"language\":\"rust\""), "{}", body);
+        assert!(
+            body.contains(&format!("\"sdk_version\":\"{}\"", SDK_VERSION)),
+            "{}",
+            body
+        );
+        // os_arch mirrors the agent.os attribute format.
+        assert!(
+            body.contains(&format!(
+                "\"os_arch\":\"{}/{}\"",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )),
+            "{}",
+            body
+        );
+        assert!(body.contains("\"framework\":\"\""), "{}", body);
+        assert!(body.contains("\"app_version\":\"1.4.2\""), "{}", body);
+        assert!(body.contains("\"dependencies\":[]"), "{}", body);
+    }
+
+    #[test]
+    fn manifest_field_order_is_stable() {
+        let body = build_manifest_with("svc", SDK_VERSION, "");
+        let order: Vec<&str> = [
+            "service_name",
+            "language",
+            "sdk_version",
+            "runtime_version",
+            "framework",
+            "os_arch",
+            "app_version",
+            "dependencies",
+        ]
+        .to_vec();
+        let mut pos = 0;
+        for field in order {
+            let at = body.find(&format!("\"{}\"", field)).unwrap_or_else(|| panic!("missing {}", field));
+            assert!(at > pos, "{} out of order in {}", field, body);
+            pos = at;
+        }
+    }
+
+    #[test]
+    fn manifest_escapes_values() {
+        let body = build_manifest_with("pay\"ments\n", SDK_VERSION, "");
+        assert!(
+            body.contains("\"service_name\":\"pay\\\"ments\\n\""),
+            "{}",
+            body
+        );
+    }
+
+    #[test]
+    fn manifest_wrapper_shape() {
+        // The env-reading wrapper keeps the same structure (app version not
+        // asserted: it depends on the ambient DATAFLOW_APP_VERSION).
+        let body = build_manifest("svc", SDK_VERSION);
+        assert!(body.starts_with('{') && body.ends_with('}'), "{}", body);
+        assert!(body.contains("\"language\":\"rust\""), "{}", body);
+        assert!(body.contains("\"dependencies\":[]"), "{}", body);
+    }
+
+    #[test]
+    fn http_base_resolution() {
+        // Explicit DATAFLOW_HTTP_URL wins, whitespace trimmed, trailing
+        // slash trimmed — even for a bare host:port endpoint.
+        assert_eq!(
+            http_base("api:9090", "http://api:8080/"),
+            Some("http://api:8080".to_string())
+        );
+        assert_eq!(
+            http_base("api:9090", "  https://ingest.example.com  "),
+            Some("https://ingest.example.com".to_string())
+        );
+        // URL-form endpoints map directly (trailing slash trimmed).
+        assert_eq!(
+            http_base("https://ingest.example.com/", ""),
+            Some("https://ingest.example.com".to_string())
+        );
+        assert_eq!(
+            http_base("http://ingest.example.com", ""),
+            Some("http://ingest.example.com".to_string())
+        );
+        // Bare gRPC endpoint without an HTTP override: nothing to report to.
+        assert_eq!(http_base("api:9090", ""), None);
+        assert_eq!(http_base("localhost:50051", ""), None);
+    }
 }

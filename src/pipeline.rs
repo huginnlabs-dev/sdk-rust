@@ -62,6 +62,9 @@ pub fn start() {
     if crate::settings().encryption_key.is_empty() {
         eprintln!("dataflow: warning: no encryption key set; captured payloads are sent as plaintext");
     }
+    // Report the service manifest (language + platform profile) once;
+    // best-effort, independent of the tracing pipeline.
+    send_manifest();
     std::thread::Builder::new()
         .name("dataflow-sender".into())
         .spawn(sender_loop)
@@ -112,7 +115,7 @@ fn flush(endpoint: &str, api_key: &str) -> Result<(), String> {
     }
 
     let body = format!("{{\"events\":[{}]}}", batch.join(","));
-    let response = http_post(endpoint, "/api/v1/ingest", api_key, body.as_bytes())?;
+    let response = http_post(endpoint, "/api/v1/ingest", api_key, body.as_bytes(), HTTP_TIMEOUT)?;
     if !response.status.is_empty() && response.status.contains(" 200") {
         let acked = json::extract_last_seq(&response.body);
         if acked > 0 {
@@ -129,9 +132,46 @@ struct Response {
     body: String,
 }
 
+/// Ingest batch timeout (the SDK's long-standing HTTP timeout).
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Manifest reporting budget: one short attempt, never gates tracing.
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reports the service manifest once per process (`POST /api/v1/manifest`).
+/// Best-effort: own thread, short timeout, every failure silent — startup
+/// and the tracing sender are never delayed or blocked. Needs an API key
+/// and a derivable HTTP base (DATAFLOW_HTTP_URL or a URL-form endpoint).
+pub fn send_manifest() {
+    let s = crate::settings();
+    if s.api_key.is_empty() {
+        return;
+    }
+    let http_url = std::env::var("DATAFLOW_HTTP_URL").unwrap_or_default();
+    let base = match crate::http_base(&s.endpoint, &http_url) {
+        Some(b) => b,
+        None => return,
+    };
+    let api_key = s.api_key.clone();
+    let _ = std::thread::Builder::new()
+        .name("dataflow-manifest".into())
+        .spawn(move || {
+            let body = crate::build_manifest(&crate::service_name(), crate::SDK_VERSION);
+            // Any failure (connect refused, non-200, TLS-terminated base the
+            // plaintext client cannot speak) is silently ignored.
+            let _ = http_post(&base, "/api/v1/manifest", &api_key, body.as_bytes(), MANIFEST_TIMEOUT);
+        });
+}
+
 /// Minimal HTTP/1.1 POST over a plain TCP stream — no dependencies. For
 /// WAN deployments put a TLS-terminating proxy in front of the endpoint.
-fn http_post(endpoint: &str, path: &str, api_key: &str, body: &[u8]) -> Result<Response, String> {
+fn http_post(
+    endpoint: &str,
+    path: &str,
+    api_key: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<Response, String> {
     let authority = endpoint
         .trim_start_matches("http://")
         .trim_start_matches("https://")
@@ -144,8 +184,8 @@ fn http_post(endpoint: &str, path: &str, api_key: &str, body: &[u8]) -> Result<R
     let mut stream = TcpStream::connect((host.as_str(), port))
         .map_err(|e| format!("connect {}: {}", authority, e))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(10))))
+        .set_read_timeout(Some(timeout))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
         .map_err(|e| e.to_string())?;
 
     let req = format!(
