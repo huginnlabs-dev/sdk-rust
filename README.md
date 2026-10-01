@@ -118,6 +118,42 @@ working. Repeated calls are no-ops; `ignore_uncaught()` restores the
 previous hook. With the SDK disabled both helpers are pure pass-through —
 chain and resume only, nothing recorded.
 
+## Log capture — application logs with trace correlation
+
+SDK 0.6.0 adds explicit application-log shipping (`POST /api/v1/logs`,
+same API-key auth): `log(level, message, fields)` plus the `debug` /
+`info` / `warn` / `error` shorthands and the field-carrying `info_with` /
+`error_with`. Lines recorded inside a `trace(...)` scope (or under any
+current span) carry that span's `trace_id` / `span_id`, so logs and traces
+line up in the server; recorded outside a span both ids ship empty. At
+most 50 fields (string values) travel per line; the message is clipped to
+8192 chars (UTF-8 safe, top kept).
+
+```rust,ignore
+use dataflow_rs::{error_with, info, trace};
+
+trace("orders.checkout", |_span| {
+    info("cart validated");
+    error_with("payment declined", &[("provider", "stripe".to_string())]);
+});
+```
+
+Delivery mirrors the span pipeline: a bounded queue (1024 lines,
+drop-oldest), a background flusher posting batches of at most 1000 lines
+on a 50-line threshold or a 500 ms tick, one retry then drop — logging
+never blocks or panics the caller. Call `flush_logs()` before process exit
+to ship the remainder synchronously (the queue does not survive a
+restart). The HTTP base is resolved manifest-style: a URL-form
+`DATAFLOW_ENDPOINT` maps directly, `DATAFLOW_HTTP_URL` overrides, and a
+bare `host:port` (gRPC) endpoint has no derivable base — logging stays
+off. With the SDK disabled every helper is a no-op.
+
+Levels are normalized to the wire set `debug | info | warn | error`:
+case/whitespace are trimmed, common aliases map onto the nearest level
+(`trace` → `debug`, `warning` → `warn`, `fatal` → `error`), and unknown
+levels ship as `info`. v1 is an explicit API only — a facade over the
+ecosystem `log` crate may come later.
+
 ## Route scanning — the `dataflow-scan` binary
 
 SDK 0.4.0 ships a second binary target, `dataflow-scan`: a static route

@@ -21,6 +21,8 @@
 //! ([`capture_panic`] / [`capture_uncaught`]) records panics with
 //! `error.stack` backtraces on the current span or a synthetic span and
 //! always resumes (or chains) so crash handling stays with the framework.
+//! Log capture ([`log`] and its level shorthands) ships application log
+//! lines carrying the current span's trace ids to `POST /api/v1/logs`.
 //! The `dataflow-scan` binary (the [`scan`] module) statically extracts
 //! declared HTTP routes from Rust sources and reports them to the server
 //! catalog.
@@ -41,16 +43,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod crash;
 pub mod crypto;
 pub mod json;
+pub mod logs;
 mod pii;
 mod pipeline;
 pub mod scan;
 pub mod transport;
 
 pub use crash::{capture_panic, capture_uncaught, ignore_uncaught};
+pub use logs::{debug, error, error_with, flush_logs, info, info_with, log, warn};
 pub use transport::{db_span, http_span, DbSpan, HttpSpan};
 
 /// SDK version stamped into agent metadata and the service manifest.
-pub const SDK_VERSION: &str = "0.5.0";
+pub const SDK_VERSION: &str = "0.6.0";
 
 /// Payload field value: a small JSON-ready enum (no serde dependency).
 #[derive(Clone, Debug)]
@@ -379,6 +383,10 @@ impl Span {
     }
 
     pub fn trace_id(&self) -> String { self.inner.trace_id.clone() }
+
+    /// The span's own id — stamped onto log lines recorded while this
+    /// span is the thread's current one ([`crate::logs`]).
+    pub fn span_id(&self) -> String { self.inner.span_id.clone() }
 
     /// Ends the span and queues it for delivery (idempotent).
     pub fn end(&self) {
