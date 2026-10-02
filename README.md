@@ -5,7 +5,9 @@ thread-local trace context, and a background sender shipping E2E-encrypted
 batches to the Dataflow ingest API (`POST /api/v1/ingest`). No async
 runtime, no HTTP-client dependency — delivery is a minimal blocking POST,
 and payload values are sealed with AES-256-GCM before they leave the
-process.
+process. Framework integrations (axum, actix-web, SQLx) are opt-in via
+[feature flags](#integrations---axum--actix--sqlx-feature-gated) — with
+none enabled the core has zero third-party dependencies.
 
 ## Quick start
 
@@ -154,6 +156,85 @@ case/whitespace are trimmed, common aliases map onto the nearest level
 levels ship as `info`. v1 is an explicit API only — a facade over the
 ecosystem `log` crate may come later.
 
+## Integrations — axum / actix / sqlx (feature-gated)
+
+SDK 0.8.0 ships optional framework integrations compiled only when their
+feature is enabled; each pulls in exactly that framework and nothing else:
+
+```toml
+[dependencies]
+dataflow-rs = { version = "0.8", features = ["axum", "sqlx"] }
+```
+
+| Feature | Framework | API |
+| --- | --- | --- |
+| `axum` | axum 0.7 (tower 0.4) | `TraceLayer` (tower `Layer`) and `axum_middleware` (`axum::middleware::from_fn`) |
+| `actix` | actix-web 4 | `DataflowMiddleware` (`App::wrap`) |
+| `sqlx` | sqlx 0.8 (runtime-tokio) | `query_span(pool, sql)`, `db_system_from_url` |
+
+All server middleware share the same span semantics as
+`start_server_span_inherited`: one `HTTP_SERVER` span per request named
+`"METHOD path"` (agent metadata stamped), the incoming
+`X-Dataflow-Trace-Id` header adopted so the caller joins the trace,
+`status_code` recorded from the response and an `error_message` for 5xx
+responses or failed handler futures. While the handler runs, the server
+span is the thread's current span — nested `trace(...)` scopes become
+children and `info!`-style log lines carry the request's ids. With the SDK
+disabled every middleware is pure pass-through.
+
+### axum 0.7
+
+```rust,ignore
+use axum::{routing::get, Router};
+
+let app: Router = Router::new()
+    .route("/orders", get(orders::list))
+    .layer(dataflow_rs::TraceLayer); // or .layer(axum::middleware::from_fn(dataflow_rs::axum_middleware))
+```
+
+`TraceLayer` preserves the wrapped service's error type (axum's
+`Infallible` flows through untouched), so it composes like any tower
+layer. Caveat inherited from the thread-local context model: on
+multi-threaded tokio runtimes a task that hops threads mid-request
+detaches its *nested* spans (the server span itself lives in the
+middleware future and is unaffected). axum 0.8 support would come with a
+tower 0.5 layer — not bundled yet.
+
+### actix-web 4
+
+```rust,ignore
+use actix_web::{App, web};
+
+let app = App::new()
+    .wrap(dataflow_rs::DataflowMiddleware)
+    .route("/orders", web::get().to(orders::list));
+```
+
+actix workers poll each request task on one thread, so nested spans and
+log correlation work as designed.
+
+### sqlx (pragmatic helper, not driver patching)
+
+sqlx exposes no portable query callbacks, so instead of patching the
+driver the `sqlx` feature provides first-class helpers that run one
+statement inside a `DB_QUERY` span — name from `stmt_summary`
+(`"SELECT orders"`), `db.system` from the pool's driver
+(`PostgreSQL` → `postgres`, `MySQL` → `mysql`, `SQLite` → `sqlite`,
+`MSSQL` → `mssql`), `db.statement` clipped to 200 chars, bind values never
+captured, status 200 / driver error + 500 recorded:
+
+```rust,ignore
+dataflow_rs::query_span(&pool, "INSERT INTO orders (id) VALUES (1)").await?;
+```
+
+The helper covers plain `execute` round-trips (`INSERT`/`UPDATE`/`DDL` and
+scalar `SELECT`s); for `query_as`/`fetch_all` flows keep the core
+[`db_span`](#transport-spans---outgoing-http-and-database-calls) RAII
+guard around the call. `db.system` is taken from `Database::NAME`, not the
+URL — sqlx's `ConnectOptions::to_url_lossy` panics for `sqlite::memory:`
+pools, and a tracing helper must never panic (use `db_system_from_url` if
+you hold the raw URL).
+
 ## Route scanning — the `dataflow-scan` binary
 
 SDK 0.4.0 ships a second binary target, `dataflow-scan`: a static route
@@ -223,5 +304,6 @@ duplicates collapse.
 ## Testing
 
 ```sh
-cargo test
+cargo test                # core (no features — integrations compiled out)
+cargo test --all-features # core + axum/actix/sqlx integrations
 ```

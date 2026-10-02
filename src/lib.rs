@@ -27,6 +27,11 @@
 //! declared HTTP routes from Rust sources and reports them to the server
 //! catalog.
 //!
+//! Framework integrations are optional and feature-gated — `axum`,
+//! `actix` and `sqlx` (see the [`integrations`] module). With no feature
+//! enabled this crate has zero third-party dependencies; enabling one
+//! pulls in only that framework.
+//!
 //! Env: `DATAFLOW_ENDPOINT` (http://host:port — plaintext HTTP, front it
 //! with a TLS-terminating proxy for WAN), `DATAFLOW_API_KEY`,
 //! `DATAFLOW_SERVICE_NAME`, `DATAFLOW_ENCRYPTION_KEY`,
@@ -49,12 +54,24 @@ mod pipeline;
 pub mod scan;
 pub mod transport;
 
+/// Optional framework integrations (`axum`, `actix`, `sqlx` features);
+/// compiled out entirely when all features are off.
+#[cfg(any(feature = "axum", feature = "actix", feature = "sqlx"))]
+pub mod integrations;
+
 pub use crash::{capture_panic, capture_uncaught, ignore_uncaught};
 pub use logs::{debug, error, error_with, flush_logs, info, info_with, log, warn};
 pub use transport::{db_span, http_span, DbSpan, HttpSpan};
 
+#[cfg(feature = "axum")]
+pub use integrations::axum::{axum_middleware, TraceLayer};
+#[cfg(feature = "actix")]
+pub use integrations::actix::DataflowMiddleware;
+#[cfg(feature = "sqlx")]
+pub use integrations::sqlx::{db_system_from_url, query_span};
+
 /// SDK version stamped into agent metadata and the service manifest.
-pub const SDK_VERSION: &str = "0.6.0";
+pub const SDK_VERSION: &str = "0.8.0";
 
 /// Payload field value: a small JSON-ready enum (no serde dependency).
 #[derive(Clone, Debug)]
@@ -479,6 +496,19 @@ impl Trace {
     pub fn with_kind(name: &str, kind: &'static str) -> Trace {
         let previous = current();
         let span = Span::new(name, kind, previous.as_ref());
+        CURRENT.with(|c| *c.borrow_mut() = Some(span.clone()));
+        Trace { span, previous, skip_drop: false }
+    }
+
+    /// Makes an already-open span the thread's current one — the building
+    /// block for framework middleware that opens an entry-point span (e.g.
+    /// via [`start_server_span_inherited`]) and then runs the rest of the
+    /// stack inside it, so nested [`trace`] scopes and log lines attach.
+    /// The previous span is restored on drop; the span itself is ended by
+    /// [`end_now`](Trace::end_now) or the drop, whichever comes first.
+    #[cfg(any(feature = "axum", feature = "actix", feature = "sqlx"))]
+    pub(crate) fn attach(span: Span) -> Trace {
+        let previous = current();
         CURRENT.with(|c| *c.borrow_mut() = Some(span.clone()));
         Trace { span, previous, skip_drop: false }
     }

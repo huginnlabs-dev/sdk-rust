@@ -1,9 +1,21 @@
 [package]
 name = "dataflow-rs"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 description = "HuginnLabs Dataflow SDK for Rust — runtime tracing with E2E-encrypted payloads"
 license = "MIT"
+
+[features]
+default = []
+# axum/tower server middleware (axum 0.7, tower 0.4). tokio rides along
+# for the feature's own tests (any axum app needs tokio anyway).
+axum = ["dep:axum", "dep:tower", "dep:tokio"]
+# actix-web 4 server middleware (self-contained: actix brings its runtime).
+actix = ["dep:actix-web"]
+# SQLx query helpers. Pins the tokio runtime and the sqlite driver for the
+# convenience pool; other drivers (postgres, mysql) activate by adding your
+# own sqlx dependency — cargo feature-unifies the rest.
+sqlx = ["dep:sqlx", "dep:tokio"]
 
 [dependencies]
 # Pure-Rust RustCrypto stack: audited, no C toolchain required.
@@ -11,6 +23,14 @@ aes-gcm = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 pbkdf2 = "0.12"
+
+# Optional integration dependencies — none of these enter the build while
+# their feature is off (the core stays dependency-free).
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true, features = ["util"] }
+actix-web = { version = "4", optional = true, default-features = false, features = ["macros"] }
+sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", optional = true, features = ["rt", "macros"] }
 
 [[bin]]
 name = "dataflow-scan"
