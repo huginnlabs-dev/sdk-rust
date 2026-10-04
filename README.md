@@ -314,7 +314,7 @@ The runtime overhead of every Dataflow SDK is measured with a uniform
 benchmark: the same ~1 ms CPU-bound HTTP endpoint in three configs (no
 instrumentation / Dataflow SDK / OpenTelemetry), one shared load driver,
 spans exported live. Methodology, current numbers and reproduction steps:
-BENCHMARKS.md (repo root of the Dataflow monorepo) in the Dataflow monorepo root.
+Numbers are published in each SDK README as they are measured; the full harness lives in the Dataflow monorepo `bench/`.
 
 Numbers for this SDK: **queued** — the harness follows the same contract
 and will land here.
