@@ -313,8 +313,23 @@ cargo test --all-features # core + axum/actix/sqlx integrations
 The runtime overhead of every Dataflow SDK is measured with a uniform
 benchmark: the same ~1 ms CPU-bound HTTP endpoint in three configs (no
 instrumentation / Dataflow SDK / OpenTelemetry), one shared load driver,
-spans exported live. Methodology, current numbers and reproduction steps:
-Numbers are published in each SDK README as they are measured; the full harness lives in the Dataflow monorepo `bench/`.
+spans exported live. Numbers are published in each SDK README as they are
+measured; the full harness lives in the Dataflow monorepo `bench/`.
 
-Numbers for this SDK: **queued** — the harness follows the same contract
-and will land here.
+Measured for this SDK (0.8.0, native Windows release build, std-only
+threaded server, driver c=16 for 60 s, two rounds, spans exported live
+to a local Dataflow server):
+
+| Config | Throughput | p50 | p95 | p99 |
+|--------|-----------|-----|-----|-----|
+| Baseline | 12 868–13 024 rps | 1.18 ms | 1.66 ms | 2.0 ms |
+| + Dataflow SDK | 11 228–11 352 rps (**≈ −13%**) | 1.37 ms | 1.86 ms | 2.27 ms |
+| + OpenTelemetry | 12 866–12 945 rps (≈ 0%, noise) | 1.19 ms | 1.67 ms | 2.02 ms |
+
+The SDK's per-request work is span JSON encoding plus a hand-off to the
+export pipeline; at ~13k enqueues/s the replay buffer stays saturated
+(its batched REST flush caps below the enqueue rate), so this figure
+includes that overload churn — on unsaturated loads only the encode +
+hand-off cost remains. OTEL's batch processor keeps spans as structs and
+encodes in its exporter thread, which is why it measures at baseline
+here.
