@@ -1,4 +1,11 @@
+<div align="center">
+
+  <img src="assets/mark.svg" width="72" alt="Dataflow mark" />
+
 # dataflow-rs — HuginnLabs Dataflow SDK for Rust
+
+</div>
+
 
 Runtime tracing for Rust services: RAII spans (mirroring the C++ SDK), a
 thread-local trace context, and a background sender shipping E2E-encrypted

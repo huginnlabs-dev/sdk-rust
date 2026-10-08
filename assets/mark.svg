@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- HuginnLabs Dataflow brand mark — vector master (geometry matched to
+       the approved raster mark-c1: straight baseline, 1:1.6:2.2 height rhythm,
+       per-bar vertical ember→rose gradient). -->
+  <defs>
+    <!-- per-bar vertical gradient: every bar carries the full ember→rose sweep,
+         like the approved raster (objectBoundingBox = per rect) -->
+    <linearGradient id="emberRose" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#D97706"/>
+      <stop offset="1" stop-color="#E11D48"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="110" fill="#17171D"/>
+  <rect x="102" y="256" width="76" height="120" rx="38" fill="url(#emberRose)"/>
+  <rect x="218" y="186" width="76" height="190" rx="38" fill="url(#emberRose)"/>
+  <rect x="334" y="116" width="76" height="260" rx="38" fill="url(#emberRose)"/>
+</svg>
